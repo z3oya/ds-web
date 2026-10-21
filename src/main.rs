@@ -1,10 +1,11 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const BASE: &str = "https://api.deepseek.com";
+const TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Parser)]
 #[command(name = "ds-web", version, about = "DeepSeek Search & Fetch CLI")]
@@ -30,45 +31,46 @@ enum Commands {
     Status,
 }
 
-fn api_key() -> Result<String> {
-    std::env::var("DEEPSEEK_API_KEY").context("缺少 DEEPSEEK_API_KEY 环境变量")
+fn auth() -> Result<String> {
+    let key = std::env::var("DEEPSEEK_API_KEY")
+        .context("DEEPSEEK_API_KEY environment variable not set")?;
+    Ok(format!("Bearer {key}"))
 }
 
-fn take_body(resp: ureq::Response) -> Result<Value> {
-    Ok(resp.into_json()?)
-}
-
-fn fail_status(code: u16, resp: ureq::Response) -> anyhow::Error {
-    let body = resp.into_string().unwrap_or_default();
-    let head: String = body.chars().take(300).collect();
-    anyhow::anyhow!("HTTP {code}: {head}")
+fn send(req: ureq::Request, body: Option<String>) -> Result<Value> {
+    let attempted = match body {
+        Some(b) => req.timeout(TIMEOUT).send_string(&b),
+        None => req.timeout(TIMEOUT).call(),
+    };
+    match attempted {
+        Ok(resp) => Ok(resp.into_json()?),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            let head: String = text.chars().take(300).collect();
+            bail!("HTTP {code}: {head}");
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn post_json(path: &str, payload: &Value) -> Result<Value> {
-    match ureq::post(&format!("{BASE}{path}"))
-        .set("Authorization", &format!("Bearer {}", api_key()?))
-        .set("Content-Type", "application/json")
-        .timeout(Duration::from_secs(120))
-        .send_string(&payload.to_string())
-    {
-        Ok(resp) => take_body(resp),
-        Err(ureq::Error::Status(code, resp)) => Err(fail_status(code, resp)),
-        Err(e) => Err(e.into()),
-    }
-    .context(format!("请求 {path} 失败"))
+    let auth = auth()?;
+    send(
+        ureq::post(&format!("{BASE}{path}"))
+            .set("Authorization", &auth)
+            .set("Content-Type", "application/json"),
+        Some(payload.to_string()),
+    )
+    .with_context(|| format!("request to {path} failed"))
 }
 
 fn get_json(path: &str) -> Result<Value> {
-    match ureq::get(&format!("{BASE}{path}"))
-        .set("Authorization", &format!("Bearer {}", api_key()?))
-        .timeout(Duration::from_secs(60))
-        .call()
-    {
-        Ok(resp) => take_body(resp),
-        Err(ureq::Error::Status(code, resp)) => Err(fail_status(code, resp)),
-        Err(e) => Err(e.into()),
-    }
-    .context(format!("请求 {path} 失败"))
+    let auth = auth()?;
+    send(
+        ureq::get(&format!("{BASE}{path}")).set("Authorization", &auth),
+        None,
+    )
+    .with_context(|| format!("request to {path} failed"))
 }
 
 fn print_json(v: &Value) -> Result<()> {
@@ -88,9 +90,11 @@ fn cmd_search(query: &str, count: Option<u32>, content: bool, as_json: bool) -> 
     if as_json {
         return print_json(&data);
     }
-    let results = data["results"].as_array().cloned().unwrap_or_default();
+    let Some(results) = data["results"].as_array() else {
+        return Ok(());
+    };
     if results.is_empty() {
-        println!("(无结果)");
+        println!("(no results)");
         return Ok(());
     }
     for (i, it) in results.iter().enumerate() {
@@ -104,7 +108,7 @@ fn cmd_search(query: &str, count: Option<u32>, content: bool, as_json: bool) -> 
             extra.push(format!("authority={a}"));
         }
         if let Some(d) = it["date"].as_str() {
-            extra.push(format!("date={}", &d[..d.len().min(10)]));
+            extra.push(format!("date={}", d.get(..10).unwrap_or(d)));
         }
         if let Some(s) = it["site_name"].as_str() {
             extra.push(format!("site={s}"));
@@ -125,11 +129,9 @@ fn cmd_fetch(url: &str, as_json: bool) -> Result<()> {
     if as_json {
         return print_json(&data);
     }
-    if let Some(t) = data["title"].as_str() {
-        if !t.is_empty() {
-            println!("# {t}");
-            println!();
-        }
+    if let Some(t) = data["title"].as_str().filter(|t| !t.is_empty()) {
+        println!("# {t}");
+        println!();
     }
     match data["content"].as_str() {
         Some(c) if !c.is_empty() => println!("{c}"),
@@ -143,12 +145,15 @@ fn cmd_status(as_json: bool) -> Result<()> {
     if as_json {
         return print_json(&data);
     }
-    println!("可用: {}", data["is_available"].as_bool().unwrap_or(false));
+    println!(
+        "available: {}",
+        data["is_available"].as_bool().unwrap_or(false)
+    );
     if let Some(infos) = data["balance_infos"].as_array() {
         for info in infos {
             let cur = info["currency"].as_str().unwrap_or("?");
             println!(
-                "余额 ({cur}): 总 {} = 赠送 {} + 充值 {}",
+                "balance ({cur}): total {} = granted {} + topped up {}",
                 info["total_balance"].as_str().unwrap_or("?"),
                 info["granted_balance"].as_str().unwrap_or("?"),
                 info["topped_up_balance"].as_str().unwrap_or("?"),
@@ -170,7 +175,7 @@ fn main() {
         Commands::Status => cmd_status(cli.json),
     };
     if let Err(e) = result {
-        eprintln!("错误: {e:#}");
+        eprintln!("error: {e:#}");
         std::process::exit(1);
     }
 }
