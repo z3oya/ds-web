@@ -24,6 +24,10 @@ enum Commands {
         count: Option<u32>,
         #[arg(long)]
         content: bool,
+        #[arg(long)]
+        ori_question: Option<String>,
+        #[arg(long)]
+        localization: Option<String>,
     },
     Fetch {
         url: String,
@@ -78,13 +82,26 @@ fn print_json(v: &Value) -> Result<()> {
     Ok(())
 }
 
-fn cmd_search(query: &str, count: Option<u32>, content: bool, as_json: bool) -> Result<()> {
+fn cmd_search(
+    query: &str,
+    count: Option<u32>,
+    content: bool,
+    ori_question: Option<&str>,
+    localization: Option<&str>,
+    as_json: bool,
+) -> Result<()> {
     let mut payload = json!({ "query": query });
     if let Some(c) = count {
         payload["count"] = json!(c);
     }
     if content {
         payload["need_content"] = json!(true);
+    }
+    if let Some(q) = ori_question {
+        payload["ori_question"] = json!(q);
+    }
+    if let Some(ip) = localization {
+        payload["localization"] = json!(ip);
     }
     let data = post_json("/v1/tools/search", &payload)?;
     if as_json {
@@ -170,7 +187,16 @@ fn main() {
             query,
             count,
             content,
-        } => cmd_search(&query, count, content, cli.json),
+            ori_question,
+            localization,
+        } => cmd_search(
+            &query,
+            count,
+            content,
+            ori_question.as_deref(),
+            localization.as_deref(),
+            cli.json,
+        ),
         Commands::Fetch { url } => cmd_fetch(&url, cli.json),
         Commands::Status => cmd_status(cli.json),
     };
